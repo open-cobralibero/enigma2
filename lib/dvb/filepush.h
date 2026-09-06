@@ -1,0 +1,129 @@
+#ifndef __lib_base_filepush_h
+#define __lib_base_filepush_h
+
+#include <lib/base/thread.h>
+#include <lib/base/ioprio.h>
+#include <libsig_comp.h>
+#include <lib/base/message.h>
+#include <sys/types.h>
+#include <lib/base/rawfile.h>
+#include <atomic>
+
+#define FLAGBIT_TIMESHIFT  (1 << 0)
+#define FLAGBIT_RAM_MODE   (1 << 1)
+
+class iFilePushScatterGather
+{
+public:
+	virtual void getNextSourceSpan(off_t current_offset, size_t bytes_read, off_t &start, size_t &size, int blocksize, int &sof)=0;
+	virtual ~iFilePushScatterGather() {}
+};
+
+class eFilePushThread: public eThread, public sigc::trackable, public iObject
+{
+	DECLARE_REF(eFilePushThread);
+public:
+	eFilePushThread(int prio_class=IOPRIO_CLASS_BE, int prio_level=0, int blocksize=188, size_t buffersize=188*1024, int flags=0);
+	~eFilePushThread() override;
+	void thread();
+	void stop();
+	void start(ePtr<iTsSource> &source, int destfd);
+
+	void pause();
+	void resume();
+
+	void enablePVRCommit(int);
+	/* stream mode will wait on EOF until more data is available. */
+	void setStreamMode(int);
+	void setScatterGather(iFilePushScatterGather *);
+
+	/* Force the read position to the given byte offset.
+	 * Thread-safe: stored via std::atomic, picked up by the push
+	 * thread on its next loop iteration via exchange().  Used by RAM
+	 * timeshift for seek and lap-recovery because the normal cue-sheet
+	 * path goes through tstools which has no valid .ap data for RAM.
+	 *
+	 * exchange() atomically reads the current value and resets to -1
+	 * in one operation — prevents the lost-update race that exists
+	 * with separate read+write on volatile (as in the original code). */
+	void forcePosition(off_t pos);
+
+	enum { evtEOF, evtReadError, evtWriteError, evtUser, evtStopped };
+	sigc::signal<void(int)> m_event;
+
+		/* you can send private events if you want */
+	void sendEvent(int evt);
+protected:
+	virtual void filterRecordData(const unsigned char *data, int len);
+private:
+	int prio_class;
+	int prio;
+	iFilePushScatterGather *m_sg;
+	int m_stop;
+	int m_fd_dest;
+	int m_send_pvr_commit;
+	int m_stream_mode;
+	int m_flags;
+	int m_sof;
+	int m_blocksize;
+	size_t m_buffersize;
+	unsigned char* m_buffer;
+	off_t m_current_position;
+	std::atomic<off_t> m_force_position;
+
+	ePtr<iTsSource> m_source;
+
+	eFixedMessagePump<int> m_messagepump;
+	eSingleLock m_run_mutex;
+	eCondition m_run_cond;
+	int m_run_state;
+
+	void recvEvent(const int &evt);
+};
+
+class eFilePushThreadRecorder: public eThread, public sigc::trackable
+{
+public:
+	eFilePushThreadRecorder(unsigned char* buffer, size_t buffersize=188*1024);
+	void thread();
+	void stop();
+	void start(int sourcefd);
+
+	enum { evtEOF, evtReadError, evtWriteError, evtUser, evtStopped, evtStreamCorrupt };
+	sigc::signal<void(int)> m_event;
+
+	int getProtocol() { return m_protocol;}
+	void setProtocol(int i){ m_protocol = i;}
+	void setSession(int se, int st) { m_session_id = se; m_stream_id = st;}
+	static const size_t minWriteDefault = 32 * 1024;
+	static const size_t minWriteMPEG = 4 * 1024;
+	void setMinWrite(size_t s) { m_buffer_min_write = s; }
+	int read_dmx(int fd, void *m_buffer, int size);
+	int pushReply(void *buf, int len);
+	void sendEvent(int evt);
+	static int64_t getTick();
+	static int read_ts(int fd, unsigned char *buf, int size);
+protected:
+	/* Write data to the output destination. Returns bytes written.
+	 * On failure returns <0 and sets errno. The implementation may
+	 * freely modify m_buffer. */
+	virtual int writeData(int len) = 0;
+	/* Called when the recording thread is stopping. Allows cleanup
+	 * of memory, flushing buffers, and terminating outstanding IO. */
+	virtual void flush() = 0;
+
+	int m_fd_source;
+	size_t m_buffersize;
+	unsigned char* m_buffer;
+	unsigned int m_overflow_count;
+	size_t m_buffer_fill;
+	size_t m_buffer_min_write = minWriteDefault;
+	int m_stop;
+private:
+	eFixedMessagePump<int> m_messagepump;
+	void recvEvent(const int &evt);
+	int m_protocol, m_session_id, m_stream_id, m_packet_no;
+	std::vector<unsigned char> m_reply;
+};
+
+#endif
